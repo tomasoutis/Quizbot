@@ -514,8 +514,7 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = query.data
     
     if data == "admin_users":
-        # Count Users (Expensive operation in Firestore if many users, utilize aggregation query in production)
-        # For simple tier:
+        # Count Users
         users = db.collection('users').count().get()
         count = users[0][0].value
         await query.message.reply_text(f"👥 Total Registered Users: {count}")
@@ -523,6 +522,13 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "admin_upload":
         await query.message.reply_text("📂 **Upload Mode**\n\n1. Reply with the Department Name.\n2. Then upload the JSON file.")
         context.user_data['admin_state'] = 'awaiting_dept_name'
+
+    # --- ADDED THIS BLOCK ---
+    elif data == "admin_ad":
+        await query.message.reply_text("Send the text/link content for the Ad.")
+        context.user_data['admin_state'] = 'awaiting_ad_link'
+    
+    await query.answer() # Always answer the query to stop the loading animation
 
 async def admin_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
