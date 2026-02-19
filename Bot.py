@@ -17,6 +17,7 @@ from telegram.ext import (
     ApplicationBuilder, CommandHandler, CallbackQueryHandler, 
     MessageHandler, filters, ContextTypes, ConversationHandler
 )
+from telegram.error import BadRequest
 from telegram.constants import ParseMode
 
 # -----------------------------------------------------------------------------
@@ -252,6 +253,7 @@ async def send_question(update: Update, context: ContextTypes.DEFAULT_TYPE, user
         return
 
     # --- AD LOGIC (Every 5 Qs, but not at 0) ---
+    # Show sponsor ads after every 5 questions (i.e., when q_index is 5,10,15,...)
     if q_index > 0 and q_index % 5 == 0:
         ad = get_ad_to_show(session.get('ad_break_counter', 0))
         if ad:
@@ -268,7 +270,7 @@ async def send_question(update: Update, context: ContextTypes.DEFAULT_TYPE, user
                 if ad.get('message_link'):
                      await context.bot.send_message(chat_id=user_id, text=f"📢 **Sponsor**\n{ad['message_link']}")
                 
-                time.sleep(2) # Slight delay
+                time.sleep(4) # Slight delay
             except Exception as e:
                 logger.error(f"Ad error: {e}")
 
@@ -278,17 +280,15 @@ async def send_question(update: Update, context: ContextTypes.DEFAULT_TYPE, user
     # To avoid high reads, we should query by number.
     q_num = q_index + 1
     
-    # Query for the specific question number
-    q_ref = db.collection('departments').document(dept_id).collection('questions').where('question_number', '==', q_num).limit(1).stream()
-    
-    question_data = None
-    for q in q_ref:
-        question_data = q.to_dict()
-        break
+    # Fetch the specific question document by its number (stored as document id during upload)
+    q_doc = db.collection('departments').document(dept_id).collection('questions').document(str(q_num)).get()
+    question_data = q_doc.to_dict() if q_doc.exists else None
     
     if not question_data:
-        # Fallback if question missing
-        await context.bot.send_message(chat_id=user_id, text="Error: Question not found. Ending session.")
+        # Fallback if question missing — log with dept and q_num for debugging
+        logger.warning(f"Question not found: dept={dept_id} question_number={q_num} for user={user_id}")
+        # Inform the user and return to main menu
+        await context.bot.send_message(chat_id=user_id, text=f"Error: Question {q_num} not found in department {dept_id}. Returning to main menu.")
         await show_main_menu(update, context)
         return
 
@@ -325,6 +325,18 @@ async def send_question(update: Update, context: ContextTypes.DEFAULT_TYPE, user
         await update.callback_query.message.reply_text(text=text, reply_markup=markup, parse_mode=ParseMode.MARKDOWN)
     else:
         await update.message.reply_text(text=text, reply_markup=markup, parse_mode=ParseMode.MARKDOWN)
+    # Send with Markdown, but fallback to plain text if Telegram raises a parse error
+    try:
+        if update.callback_query:
+            await update.callback_query.message.reply_text(text=text, reply_markup=markup, parse_mode=ParseMode.MARKDOWN)
+        else:
+            await update.message.reply_text(text=text, reply_markup=markup, parse_mode=ParseMode.MARKDOWN)
+    except BadRequest as e:
+        logger.warning(f"Markdown parse error sending question {q_num} (dept={dept_id}): {e}")
+        if update.callback_query:
+            await update.callback_query.message.reply_text(text=text, reply_markup=markup)
+        else:
+            await update.message.reply_text(text=text, reply_markup=markup)
 
 async def handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -408,6 +420,14 @@ async def handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     nav_buttons = [[InlineKeyboardButton("Next ➡️", callback_data="next_question")]]
 
     await query.edit_message_text(text=combined_text, reply_markup=InlineKeyboardMarkup(nav_buttons), parse_mode=ParseMode.MARKDOWN)
+    # Try to edit message using Markdown formatting; if Telegram reports a BadRequest
+    # (commonly "can't find end of the entity" for malformed markdown), retry
+    # without a parse_mode so content is delivered as plain text.
+    try:
+        await query.edit_message_text(text=combined_text, reply_markup=InlineKeyboardMarkup(nav_buttons), parse_mode=ParseMode.MARKDOWN)
+    except BadRequest as e:
+        logger.warning(f"Markdown parse error editing answer for q{q_num}: {e}. Retrying without parse mode.")
+        await query.edit_message_text(text=combined_text, reply_markup=InlineKeyboardMarkup(nav_buttons))
 
 async def next_question_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -609,7 +629,7 @@ async def admin_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
         
         # Add Deep Link
         deep_link = f"https://t.me/{context.bot.username}?start=dept_{dept_name}"
-        final_caption = f"{caption}\n\n👉 Start Quiz: {deep_link}"
+        final_caption = f"{caption}\n\n👉 Start Exam: {deep_link}"
         
         await context.bot.send_photo(
             chat_id=PUBLIC_CHANNEL_ID,
