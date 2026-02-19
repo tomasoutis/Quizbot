@@ -219,66 +219,10 @@ async def start_quiz(update: Update, context: ContextTypes.DEFAULT_TYPE, dept_id
     await send_question(update, context, user_id, session)
 
 async def send_question(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id, session):
-    dept_id = session['department_id']
-    q_index = session['current_question_index']
-    
-    # --- CHECK REFERRAL LOCK (After Q25) ---
-    if q_index == 25:
-        user_doc = get_user_data(user_id)
-        if user_doc.get('referralCount', 0) < 2:
-            # Send Summary first
-            await send_session_summary(update, context, session, "🔒 Progress Locked")
-            
-            ref_link = f"https://t.me/{context.bot.username}?start=ref_{user_id}"
-            text = (
-                "🔒 **Content Locked**\n\n"
-                "You have completed the free 25 questions.\n"
-                "**Invite 2 friends** to unlock the remaining 75 questions!\n\n"
-                f"Your Referral Link:\n`{ref_link}`"
-            )
-            keyboard = [[InlineKeyboardButton("Check Status & Continue", callback_data="check_lock")]]
-            
-            if update.callback_query:
-                await update.callback_query.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN)
-            else:
-                await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN)
-            return
-
-    # --- CHECK COMPLETION (After Q100) ---
-    if q_index >= 100:
-        await send_session_summary(update, context, session, "🏆 Session Complete")
-        db.collection('users').document(str(user_id)).update({'currentSession.sessionActive': False})
-        await show_main_menu(update, context)
-        return
-
-    # --- AD LOGIC (Every 10 Qs, but not at 0) ---
-    if q_index > 0 and q_index % 10 == 0:
-        ad = get_ad_to_show(session.get('ad_break_counter', 0))
-        if ad:
-            # Increment ad break counter
-            session['ad_break_counter'] = session.get('ad_break_counter', 0) + 1
-            db.collection('users').document(str(user_id)).update({'currentSession': session})
-            
-            # Send Ad
-            try:
-                # Assuming message_id is from the channel or a stored file_id
-                # Note: 'message_link' is stored, but to forward we need chat_id and message_id.
-                # Simplified: Admin stores file_id or we send the link.
-                # Spec says "Bot forwards/resends".
-                if ad.get('message_link'):
-                     await context.bot.send_message(chat_id=user_id, text=f"📢 **Sponsor**\n{ad['message_link']}")
-                
-                time.sleep(2) # Slight delay
-            except Exception as e:
-                logger.error(f"Ad error: {e}")
+    # ... [Keep your existing Referral, Completion, and Ad logic at the top] ...
 
     # --- FETCH QUESTION ---
-    # Questions are stored in 'departments/{dept_id}/questions/{q_id}'
-    # We assume questions are ordered by 'question_number' or ID.
-    # To avoid high reads, we should query by number.
     q_num = q_index + 1
-    
-    # Query for the specific question number
     q_ref = db.collection('departments').document(dept_id).collection('questions').where('question_number', '==', q_num).limit(1).stream()
     
     question_data = None
@@ -287,101 +231,63 @@ async def send_question(update: Update, context: ContextTypes.DEFAULT_TYPE, user
         break
     
     if not question_data:
-        # Fallback if question missing
         await context.bot.send_message(chat_id=user_id, text="Error: Question not found. Ending session.")
         await show_main_menu(update, context)
         return
 
-    # Construct UI
-    text = f"**Question {q_num}/100**\n\n{question_data['question_text']}"
+    # Construct UI: Move options into the message body
     opts = question_data['options']
+    text = (
+        f"**Question {q_num}/100**\n\n"
+        f"{question_data['question_text']}\n\n"
+        f"**A.** {opts['a']}\n"
+        f"**B.** {opts['b']}\n"
+        f"**C.** {opts['c']}\n"
+        f"**D.** {opts['d']}"
+    )
     
-    # Buttons: A | B / C | D
+    # Buttons: Short labels only
     row1 = [
-        InlineKeyboardButton(f"A. {opts['a']}", callback_data=f"ans_a_{q_num}"),
-        InlineKeyboardButton(f"B. {opts['b']}", callback_data=f"ans_b_{q_num}")
+        InlineKeyboardButton("A", callback_data=f"ans_a_{q_num}"),
+        InlineKeyboardButton("B", callback_data=f"ans_b_{q_num}")
     ]
     row2 = [
-        InlineKeyboardButton(f"C. {opts['c']}", callback_data=f"ans_c_{q_num}"),
-        InlineKeyboardButton(f"D. {opts['d']}", callback_data=f"ans_d_{q_num}")
+        InlineKeyboardButton("C", callback_data=f"ans_c_{q_num}"),
+        InlineKeyboardButton("D", callback_data=f"ans_d_{q_num}")
     ]
     row3 = [InlineKeyboardButton("🏠 Home", callback_data="home_confirm")]
     
     markup = InlineKeyboardMarkup([row1, row2, row3])
     
-    # Store Correct Answer in Callback Data is risky for cheaters, 
-    # but strictly following prompt we check answer in backend.
-    
     if update.callback_query:
-        # If previous message was an answer explanation, send new message
-        # If simply flow, edit (but editing text with different height can be jumpy)
-        # Spec says: "Edit message" for results. For new question, usually send new.
         await update.callback_query.message.reply_text(text=text, reply_markup=markup, parse_mode=ParseMode.MARKDOWN)
     else:
         await update.message.reply_text(text=text, reply_markup=markup, parse_mode=ParseMode.MARKDOWN)
 
 async def handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    user_id = update.effective_user.id
-    data = query.data # e.g. ans_a_12
-    
-    parts = data.split('_')
-    selected_opt = parts[1] # 'a'
-    q_num = int(parts[2])
-    
-    # Get Session
-    user_doc = db.collection('users').document(str(user_id))
-    user_data = user_doc.get().to_dict()
-    session = user_data.get('currentSession')
-    
-    if not session or not session.get('sessionActive'):
-        await query.answer("Session expired.")
-        return
-
-    # Prevent spamming (Check if question index matches)
-    if (session['current_question_index'] + 1) != q_num:
-        await query.answer("Please wait...", show_alert=True)
-        return
-
-    # Fetch Question Data again for verification
-    dept_id = session['department_id']
-    q_ref = db.collection('departments').document(dept_id).collection('questions').where('question_number', '==', q_num).limit(1).stream()
-    q_data = None
-    for q in q_ref:
-        q_data = q.to_dict()
-        break
-        
-    is_correct = (selected_opt == q_data['answer'])
-    
-    # Update Stats
-    updates = {
-        'totalAttempts': firestore.Increment(1),
-        'currentSession.attempted_in_session': firestore.Increment(1),
-        'currentSession.current_question_index': firestore.Increment(1)
-    }
-    
-    if is_correct:
-        updates['totalCorrect'] = firestore.Increment(1)
-        updates['currentSession.correct_in_session'] = firestore.Increment(1)
-        status_text = "✓ Correct"
-    else:
-        status_text = "✗ Incorrect"
-        
-    user_doc.update(updates)
-    
-    # Update Session Object Locally for Next Step
-    session['current_question_index'] += 1
-    session['attempted_in_session'] += 1
-    if is_correct:
-        session['correct_in_session'] += 1
+    # ... [Keep your existing callback parsing, session checks, and stat updates] ...
 
     # Edit Message
     explanation = q_data.get('explanation', 'No explanation provided.')
     correct_ans_key = q_data['answer']
     correct_text = q_data['options'][correct_ans_key]
     
+    # Reconstruct the original question and options to keep them visible
+    opts = q_data['options']
+    original_q_text = (
+        f"**Question {q_num}/100**\n\n"
+        f"{q_data['question_text']}\n\n"
+        f"**A.** {opts['a']}\n"
+        f"**B.** {opts['b']}\n"
+        f"**C.** {opts['c']}\n"
+        f"**D.** {opts['d']}\n\n"
+        f"━━━━━━━━━━━━━━━\n"
+    )
+    
+    # Combine the question text with the result
     result_msg = (
-        f"{status_text}\n\n"
+        f"{original_q_text}"
+        f"**{status_text}**\n\n"
         f"**Correct Answer:** {correct_ans_key.upper()}. {correct_text}\n"
         f"**Explanation:** {explanation}"
     )
@@ -391,7 +297,7 @@ async def handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]
     
     await query.edit_message_text(text=result_msg, reply_markup=InlineKeyboardMarkup(nav_buttons), parse_mode=ParseMode.MARKDOWN)
-
+    
 async def next_question_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     user_data = get_user_data(user_id)
