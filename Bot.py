@@ -251,8 +251,8 @@ async def send_question(update: Update, context: ContextTypes.DEFAULT_TYPE, user
         await show_main_menu(update, context)
         return
 
-    # --- AD LOGIC (Every 10 Qs, but not at 0) ---
-    if q_index > 0 and q_index % 10 == 0:
+    # --- AD LOGIC (Every 5 Qs, but not at 0) ---
+    if q_index > 0 and q_index % 5 == 0:
         ad = get_ad_to_show(session.get('ad_break_counter', 0))
         if ad:
             # Increment ad break counter
