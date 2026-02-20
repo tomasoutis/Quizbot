@@ -17,8 +17,9 @@ from telegram.ext import (
     ApplicationBuilder, CommandHandler, CallbackQueryHandler, 
     MessageHandler, filters, ContextTypes, ConversationHandler
 )
-from telegram.error import BadRequest
 from telegram.constants import ParseMode
+import re
+import html
 
 # -----------------------------------------------------------------------------
 # 1. CONFIGURATION & SETUP
@@ -119,6 +120,24 @@ def get_ad_to_show(current_index):
     
     ad_idx = current_index % len(ads)
     return ads[ad_idx]
+
+
+def escape_md(text):
+    """Escape characters that may break Telegram Markdown parsing for inserted DB text.
+
+    We only escape content coming from the database (question text, options,
+    explanations) while keeping the bot's own Markdown markers (like **..**) intact.
+    """
+    if not isinstance(text, str):
+        return text
+    return re.sub(r'([_*\[\]()~`>#+\-=|{}.!])', r'\\\\\1', text)
+
+
+def escape_html(text):
+    """HTML-escape DB/user-provided text before sending with ParseMode.HTML."""
+    if not isinstance(text, str):
+        return text
+    return html.escape(text)
 
 # -----------------------------------------------------------------------------
 # 3. BOT HANDLERS
@@ -253,7 +272,6 @@ async def send_question(update: Update, context: ContextTypes.DEFAULT_TYPE, user
         return
 
     # --- AD LOGIC (Every 5 Qs, but not at 0) ---
-    # Show sponsor ads after every 5 questions (i.e., when q_index is 5,10,15,...)
     if q_index > 0 and q_index % 5 == 0:
         ad = get_ad_to_show(session.get('ad_break_counter', 0))
         if ad:
@@ -270,7 +288,7 @@ async def send_question(update: Update, context: ContextTypes.DEFAULT_TYPE, user
                 if ad.get('message_link'):
                      await context.bot.send_message(chat_id=user_id, text=f"📢 **Sponsor**\n{ad['message_link']}")
                 
-                time.sleep(4) # Slight delay
+                time.sleep(2) # Slight delay
             except Exception as e:
                 logger.error(f"Ad error: {e}")
 
@@ -280,26 +298,35 @@ async def send_question(update: Update, context: ContextTypes.DEFAULT_TYPE, user
     # To avoid high reads, we should query by number.
     q_num = q_index + 1
     
-    # Fetch the specific question document by its number (stored as document id during upload)
-    q_doc = db.collection('departments').document(dept_id).collection('questions').document(str(q_num)).get()
-    question_data = q_doc.to_dict() if q_doc.exists else None
+    # Query for the specific question number
+    q_ref = db.collection('departments').document(dept_id).collection('questions').where('question_number', '==', q_num).limit(1).stream()
+    
+    question_data = None
+    for q in q_ref:
+        question_data = q.to_dict()
+        break
     
     if not question_data:
-        # Fallback if question missing — log with dept and q_num for debugging
-        logger.warning(f"Question not found: dept={dept_id} question_number={q_num} for user={user_id}")
-        # Inform the user and return to main menu
-        await context.bot.send_message(chat_id=user_id, text=f"Error: Question {q_num} not found in department {dept_id}. Returning to main menu.")
+        # Fallback if question missing
+        await context.bot.send_message(chat_id=user_id, text="Error: Question not found. Ending session.")
         await show_main_menu(update, context)
         return
 
     # Construct UI: Put full options in the message text, keep buttons short (A/B/C/D)
     opts = question_data['options']
+    # Use HTML-escaped DB content to avoid visible backslashes from Markdown escaping.
+    q_text = escape_html(question_data['question_text'])
+    a_text = escape_html(opts.get('a', ''))
+    b_text = escape_html(opts.get('b', ''))
+    c_text = escape_html(opts.get('c', ''))
+    d_text = escape_html(opts.get('d', ''))
+
     text = (
-        f"**Question {q_num}/100**\n\n{question_data['question_text']}\n\n"
-        f"A. {opts['a']}\n"
-        f"B. {opts['b']}\n"
-        f"C. {opts['c']}\n"
-        f"D. {opts['d']}"
+        f"<b>Question {q_num}/100</b>\n\n{q_text}\n\n"
+        f"A. {a_text}\n"
+        f"B. {b_text}\n"
+        f"C. {c_text}\n"
+        f"D. {d_text}"
     )
 
     # Buttons: short labels only so long option text isn't truncated on small screens
@@ -322,21 +349,9 @@ async def send_question(update: Update, context: ContextTypes.DEFAULT_TYPE, user
         # If previous message was an answer explanation, send new message
         # If simply flow, edit (but editing text with different height can be jumpy)
         # Spec says: "Edit message" for results. For new question, usually send new.
-        await update.callback_query.message.reply_text(text=text, reply_markup=markup, parse_mode=ParseMode.MARKDOWN)
+        await update.callback_query.message.reply_text(text=text, reply_markup=markup, parse_mode=ParseMode.HTML)
     else:
-        await update.message.reply_text(text=text, reply_markup=markup, parse_mode=ParseMode.MARKDOWN)
-    # Send with Markdown, but fallback to plain text if Telegram raises a parse error
-    try:
-        if update.callback_query:
-            await update.callback_query.message.reply_text(text=text, reply_markup=markup, parse_mode=ParseMode.MARKDOWN)
-        else:
-            await update.message.reply_text(text=text, reply_markup=markup, parse_mode=ParseMode.MARKDOWN)
-    except BadRequest as e:
-        logger.warning(f"Markdown parse error sending question {q_num} (dept={dept_id}): {e}")
-        if update.callback_query:
-            await update.callback_query.message.reply_text(text=text, reply_markup=markup)
-        else:
-            await update.message.reply_text(text=text, reply_markup=markup)
+        await update.message.reply_text(text=text, reply_markup=markup, parse_mode=ParseMode.HTML)
 
 async def handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -398,20 +413,26 @@ async def handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     correct_ans_key = q_data['answer']
     correct_text = q_data['options'][correct_ans_key]
 
+    # HTML-escape DB-provided texts for safe HTML formatting
+    esc_question_text = escape_html(q_data['question_text'])
+    esc_opts = {k: escape_html(v) for k, v in q_data['options'].items()}
+    esc_explanation = escape_html(explanation)
+    esc_correct_text = escape_html(correct_text)
+
     # Build the result block to append below the question and options (do not remove/modify the question)
     result_block = (
         f"{status_text}\n\n"
-        f"**Correct Answer:** {correct_ans_key.upper()}. {correct_text}\n"
-        f"**Explanation:** {explanation}"
+        f"<b>Correct Answer:</b> {correct_ans_key.upper()}. {esc_correct_text}\n"
+        f"<b>Explanation:</b> {esc_explanation}"
     )
 
     # Reconstruct original question+options text (same format as when sent)
     original_text = (
-        f"**Question {q_num}/100**\n\n{q_data['question_text']}\n\n"
-        f"A. {q_data['options']['a']}\n"
-        f"B. {q_data['options']['b']}\n"
-        f"C. {q_data['options']['c']}\n"
-        f"D. {q_data['options']['d']}"
+        f"<b>Question {q_num}/100</b>\n\n{esc_question_text}\n\n"
+        f"A. {esc_opts.get('a','')}\n"
+        f"B. {esc_opts.get('b','')}\n"
+        f"C. {esc_opts.get('c','')}\n"
+        f"D. {esc_opts.get('d','')}"
     )
 
     # Combine and replace the option buttons with navigation (so the four choice buttons are removed)
@@ -419,15 +440,7 @@ async def handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     nav_buttons = [[InlineKeyboardButton("Next ➡️", callback_data="next_question")]]
 
-    await query.edit_message_text(text=combined_text, reply_markup=InlineKeyboardMarkup(nav_buttons), parse_mode=ParseMode.MARKDOWN)
-    # Try to edit message using Markdown formatting; if Telegram reports a BadRequest
-    # (commonly "can't find end of the entity" for malformed markdown), retry
-    # without a parse_mode so content is delivered as plain text.
-    try:
-        await query.edit_message_text(text=combined_text, reply_markup=InlineKeyboardMarkup(nav_buttons), parse_mode=ParseMode.MARKDOWN)
-    except BadRequest as e:
-        logger.warning(f"Markdown parse error editing answer for q{q_num}: {e}. Retrying without parse mode.")
-        await query.edit_message_text(text=combined_text, reply_markup=InlineKeyboardMarkup(nav_buttons))
+    await query.edit_message_text(text=combined_text, reply_markup=InlineKeyboardMarkup(nav_buttons), parse_mode=ParseMode.HTML)
 
 async def next_question_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -441,16 +454,16 @@ async def send_session_summary(update: Update, context: ContextTypes.DEFAULT_TYP
     acc = (correct / total * 100) if total > 0 else 0
     
     text = (
-        f"**{title}**\n\n"
+        f"<b>{title}</b>\n\n"
         f"Department: {session['department_id']}\n"
         f"Questions Attempted: {total}\n"
         f"Correct Answers: {correct}\n"
         f"Accuracy: {acc:.1f}%"
     )
     if update.callback_query:
-        await update.callback_query.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+        await update.callback_query.message.reply_text(text, parse_mode=ParseMode.HTML)
     else:
-        await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+        await update.message.reply_text(text, parse_mode=ParseMode.HTML)
 
 # -----------------------------------------------------------------------------
 # 5. GENERAL CALLBACK ROUTER
@@ -629,7 +642,7 @@ async def admin_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
         
         # Add Deep Link
         deep_link = f"https://t.me/{context.bot.username}?start=dept_{dept_name}"
-        final_caption = f"{caption}\n\n👉 Start Exam: {deep_link}"
+        final_caption = f"{caption}\n\n👉 Start Quiz: {deep_link}"
         
         await context.bot.send_photo(
             chat_id=PUBLIC_CHANNEL_ID,
