@@ -156,6 +156,21 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         referral_success = create_user(user.id, referrer)
         user_data = get_user_data(user.id)
 
+    # Keep basic user profile fields up-to-date
+    try:
+        db.collection('users').document(str(user.id)).update({
+            'first_name': user.first_name or '',
+            'last_name': user.last_name or '',
+            'username': user.username or ''
+        })
+    except Exception:
+        # If update fails (rare), ensure fields exist by setting merge
+        db.collection('users').document(str(user.id)).set({
+            'first_name': user.first_name or '',
+            'last_name': user.last_name or '',
+            'username': user.username or ''
+        }, merge=True)
+
     # Notify inviter if referral succeeded and threshold reached
     if referral_success:
         inviter_data = get_user_data(referrer)
@@ -281,14 +296,24 @@ async def send_question(update: Update, context: ContextTypes.DEFAULT_TYPE, user
             
             # Send Ad
             try:
-                # Assuming message_id is from the channel or a stored file_id
-                # Note: 'message_link' is stored, but to forward we need chat_id and message_id.
-                # Simplified: Admin stores file_id or we send the link.
-                # Spec says "Bot forwards/resends".
-                if ad.get('message_link'):
-                     await context.bot.send_message(chat_id=user_id, text=f"📢 **Sponsor**\n{ad['message_link']}")
-                
-                time.sleep(2) # Slight delay
+                # Ad storage supports: {type: 'photo'|'video'|'text', file_id, caption, text}
+                if ad.get('type') == 'photo' and ad.get('file_id'):
+                    await context.bot.send_photo(chat_id=user_id, photo=ad.get('file_id'), caption=ad.get('caption',''))
+                elif ad.get('type') == 'video' and ad.get('file_id'):
+                    try:
+                        await context.bot.send_video(chat_id=user_id, video=ad.get('file_id'), caption=ad.get('caption',''))
+                    except Exception:
+                        # Fallback: if original was uploaded as a document, try sending as document
+                        try:
+                            await context.bot.send_document(chat_id=user_id, document=ad.get('file_id'), caption=ad.get('caption',''))
+                        except Exception as e:
+                            logger.error(f"Failed to send video ad as video or document: {e}")
+                elif ad.get('type') == 'text' and ad.get('text'):
+                    await context.bot.send_message(chat_id=user_id, text=ad.get('text'))
+                elif ad.get('message_link'):
+                    await context.bot.send_message(chat_id=user_id, text=f"📢 **Sponsor**\n{ad['message_link']}")
+
+                time.sleep(2)
             except Exception as e:
                 logger.error(f"Ad error: {e}")
 
@@ -407,6 +432,34 @@ async def handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     session['attempted_in_session'] += 1
     if is_correct:
         session['correct_in_session'] += 1
+
+    # --- Update leaderboard per-department ---
+    try:
+        lb_ref = db.collection('leaderboard').document(str(user_id))
+        dept = dept_id
+        # Ensure doc exists otherwise prepare initial structure
+        try:
+            # Increment attempts
+            lb_ref.update({
+                f'departments.{dept}.attempts': firestore.Increment(1),
+                'updatedAt': datetime.utcnow()
+            })
+            if is_correct:
+                lb_ref.update({f'departments.{dept}.correct': firestore.Increment(1)})
+        except Exception:
+            # Doc or field missing - create initial doc for this dept
+            init = {
+                'departments': {
+                    dept: {
+                        'attempts': 1,
+                        'correct': 1 if is_correct else 0
+                    }
+                },
+                'updatedAt': datetime.utcnow()
+            }
+            lb_ref.set(init, merge=True)
+    except Exception as e:
+        logger.error(f"Leaderboard update failed: {e}")
 
     # Edit Message
     explanation = q_data.get('explanation', 'No explanation provided.')
@@ -575,8 +628,10 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # --- ADDED THIS BLOCK ---
     elif data == "admin_ad":
-        await query.message.reply_text("Send the text/link content for the Ad.")
-        context.user_data['admin_state'] = 'awaiting_ad_link'
+        await query.message.reply_text(
+            "📣 Send the ad now as either:\n- Photo (with optional caption)\n- Video (with optional caption)\n- Plain text\n\nThe bot will store only the Telegram `file_id` or the text."
+        )
+        context.user_data['admin_state'] = 'awaiting_ad'
     
     await query.answer() # Always answer the query to stop the loading animation
 
@@ -653,23 +708,135 @@ async def admin_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
         context.user_data['admin_state'] = None
         
     # 4. Add Ad
-    if state == 'awaiting_ad_link':
-        # Simple flow: User sent message link
-        link = update.message.text
-        # Save Ad
-        db.collection('ads').add({
-            'message_link': link,
-            'order_index': int(time.time()),
-            'isActive': True
-        })
-        await update.message.reply_text("✅ Ad saved.")
-        context.user_data['admin_state'] = None
+    if state == 'awaiting_ad':
+        # Photo
+        if update.message.photo:
+            file_id = update.message.photo[-1].file_id
+            caption = update.message.caption or ''
+            db.collection('ads').add({
+                'type': 'photo',
+                'file_id': file_id,
+                'caption': caption,
+                'order_index': int(time.time()),
+                'isActive': True
+            })
+            await update.message.reply_text("✅ Photo ad saved (file_id stored).")
+            context.user_data['admin_state'] = None
+            return
+
+        # Video sent as a document (some clients send videos as documents)
+        if update.message.document and getattr(update.message.document, 'mime_type', '').startswith('video'):
+            file_id = update.message.document.file_id
+            caption = update.message.caption or ''
+            db.collection('ads').add({
+                'type': 'video',
+                'file_id': file_id,
+                'caption': caption,
+                'order_index': int(time.time()),
+                'isActive': True
+            })
+            await update.message.reply_text("✅ Video ad saved (file_id stored).")
+            context.user_data['admin_state'] = None
+            return
+
+        # Video
+        if update.message.video:
+            file_id = update.message.video.file_id
+            caption = update.message.caption or ''
+            db.collection('ads').add({
+                'type': 'video',
+                'file_id': file_id,
+                'caption': caption,
+                'order_index': int(time.time()),
+                'isActive': True
+            })
+            await update.message.reply_text("✅ Video ad saved (file_id stored).")
+            context.user_data['admin_state'] = None
+            return
+
+        # Plain Text
+        if update.message.text:
+            text = update.message.text
+            db.collection('ads').add({
+                'type': 'text',
+                'text': text,
+                'order_index': int(time.time()),
+                'isActive': True
+            })
+            await update.message.reply_text("✅ Text ad saved.")
+            context.user_data['admin_state'] = None
+            return
 
 async def admin_ad_trigger(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     if query.data == "admin_ad":
         await query.message.reply_text("Send the text/link content for the Ad.")
         context.user_data['admin_state'] = 'awaiting_ad_link'
+
+
+async def admin_leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin command: compute and display leaderboards.
+    Shows Top 10 overall by average department accuracy and Top 3 per department.
+    """
+    user_id = update.effective_user.id
+    if user_id != ADMIN_TELEGRAM_ID:
+        return
+
+    # Fetch all leaderboard entries
+    docs = db.collection('leaderboard').stream()
+    overall_list = []  # (user_id, overall_avg, total_attempts)
+    dept_lists = {}    # dept_id -> [(user_id, acc, attempts)]
+
+    for d in docs:
+        uid = d.id
+        data = d.to_dict() or {}
+        depts = data.get('departments', {})
+        per_accs = []
+        total_attempts = 0
+        for dept, stats in depts.items():
+            att = int(stats.get('attempts', 0))
+            cor = int(stats.get('correct', 0))
+            if att > 0:
+                acc = cor / att
+                per_accs.append(acc)
+                total_attempts += att
+                dept_lists.setdefault(dept, []).append((uid, acc, att))
+
+        if per_accs:
+            overall_avg = sum(per_accs) / len(per_accs)
+            overall_list.append((uid, overall_avg, total_attempts))
+
+    # Top 10 overall
+    overall_list.sort(key=lambda x: x[1], reverse=True)
+    top10 = overall_list[:10]
+
+    parts = []
+    parts.append("*Top 10 Users — Overall Average Accuracy*\n")
+    if not top10:
+        parts.append("No leaderboard data available.")
+    else:
+        for idx, (uid, avg, attempts) in enumerate(top10, start=1):
+            user_doc = db.collection('users').document(uid).get()
+            udata = user_doc.to_dict() if user_doc.exists else {}
+            name = udata.get('first_name') or udata.get('username') or uid
+            parts.append(f"{idx}. {name} — {avg*100:.1f}% ({attempts} attempts)")
+
+    # Top 3 per department
+    parts.append("\n*Top 3 Per Department*\n")
+    if not dept_lists:
+        parts.append("No per-department scores yet.")
+    else:
+        for dept, arr in dept_lists.items():
+            parts.append(f"{dept}:")
+            arr.sort(key=lambda x: x[1], reverse=True)
+            for j, (uid, acc, att) in enumerate(arr[:3], start=1):
+                user_doc = db.collection('users').document(uid).get()
+                udata = user_doc.to_dict() if user_doc.exists else {}
+                name = udata.get('first_name') or udata.get('username') or uid
+                parts.append(f" {j}. {name} — {acc*100:.1f}% ({att} attempts)")
+
+    text = "\n".join(parts)
+    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
 
 # -----------------------------------------------------------------------------
 # 7. MAIN EXECUTION
@@ -689,7 +856,9 @@ def main():
     
     # Admin Command
     application.add_handler(CommandHandler("ethioegzam", admin_panel))
-    application.add_handler(MessageHandler(filters.Document.ALL | filters.PHOTO | filters.TEXT, admin_message_handler))
+    application.add_handler(CommandHandler("leaderboard", admin_leaderboard))
+    # Include VIDEO filter so video messages trigger the admin handler
+    application.add_handler(MessageHandler(filters.Document.ALL | filters.PHOTO | filters.TEXT | filters.VIDEO, admin_message_handler))
 
     # Run Flask in separate thread
     flask_thread = threading.Thread(target=run_flask)
