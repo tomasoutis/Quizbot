@@ -52,6 +52,23 @@ db = firestore.client()
 # Flask App for Render Webserver
 app = Flask(__name__)
 
+# -----------------------------
+# In-memory caches & locks
+# -----------------------------
+# Cache users: user_id -> dict (snapshot of user doc)
+user_cache = {}
+# Cache sessions: user_id -> session dict (in-memory only until flush)
+session_cache = {}
+# Cache department questions: dept_id -> { question_number: question_data }
+dept_questions_cache = {}
+# Per-user asyncio locks to prevent concurrent session writes
+user_locks = {}
+
+def _get_user_lock(user_id):
+    if user_id not in user_locks:
+        user_locks[user_id] = asyncio.Lock()
+    return user_locks[user_id]
+
 @app.route('/')
 def home():
     return "Bot is running..."
@@ -72,11 +89,147 @@ async def check_membership(user_id, bot):
         # If bot isn't admin in channel or id is wrong, fail safe to allow (or block)
         return False
 
-def get_user_data(user_id):
-    doc = db.collection('users').document(str(user_id)).get()
-    if doc.exists:
-        return doc.to_dict()
+def get_user_data(user_id, force_refresh=False):
+    """Return cached user document if available unless force_refresh is True.
+
+    This avoids repeated reads during a session. Use force_refresh=True only
+    when needing real-time referral/unlock info.
+    """
+    uid = str(user_id)
+    if not force_refresh and uid in user_cache:
+        return user_cache[uid]
+
+    # Read once from Firestore and cache
+    try:
+        doc = db.collection('users').document(uid).get()
+        if doc.exists:
+            user_cache[uid] = doc.to_dict()
+            return user_cache[uid]
+    except Exception as e:
+        logger.error(f"Error reading user {uid} from Firestore: {e}")
     return None
+
+
+def _load_department_questions_into_cache(dept_id):
+    """Load all questions for a department into dept_questions_cache[dept_id].
+
+    This is called once when a department is first used.
+    """
+    if dept_id in dept_questions_cache:
+        return
+    try:
+        q_ref = db.collection('departments').document(dept_id).collection('questions').stream()
+        qmap = {}
+        for q in q_ref:
+            qd = q.to_dict()
+            qnum = int(qd.get('question_number', 0))
+            qmap[qnum] = qd
+        dept_questions_cache[dept_id] = qmap
+    except Exception as e:
+        logger.error(f"Failed to load questions for dept {dept_id}: {e}")
+        dept_questions_cache[dept_id] = {}
+
+
+def flush_user_session(user_id, reason="end_of_session"):
+    """Persist accumulated session changes to Firestore in a batched manner.
+
+    Writes performed:
+    - Increment `totalAttempts` and `totalCorrect` on user doc
+    - Update `currentSession` and mark `sessionActive` False when finishing
+    - Update per-department leaderboard entries (batch)
+
+    This function is synchronous (blocking) and should be awaited externally
+    if called from async context using `asyncio.to_thread` or similar. For
+    simplicity within this bot we call it directly since Firestore client is
+    blocking anyway. We protect concurrent flushes with per-user locks.
+    """
+    uid = str(user_id)
+    lock = _get_user_lock(uid)
+
+    async def _do_flush():
+        async with lock:
+            session = session_cache.get(uid)
+            if not session:
+                return
+
+            # Prepare increments
+            attempts_inc = int(session.get('attempted_in_session', 0))
+            correct_inc = int(session.get('correct_in_session', 0))
+
+            batch = db.batch()
+            user_ref = db.collection('users').document(uid)
+
+            # Update totals
+            if attempts_inc > 0 or correct_inc > 0:
+                updates = {}
+                if attempts_inc > 0:
+                    updates['totalAttempts'] = firestore.Increment(attempts_inc)
+                if correct_inc > 0:
+                    updates['totalCorrect'] = firestore.Increment(correct_inc)
+                # Also update currentSession to the latest snapshot and mark inactive if finishing
+                updates['currentSession'] = session.copy()
+                if not session.get('sessionActive', True):
+                    updates['currentSession']['sessionActive'] = False
+                batch.update(user_ref, updates)
+            else:
+                # Still update currentSession state (e.g., pause)
+                try:
+                    batch.update(user_ref, {'currentSession': session.copy()})
+                except Exception:
+                    batch.set(user_ref, {'currentSession': session.copy()}, merge=True)
+
+            # Leaderboard updates accumulated per dept
+            lb_updates = session.get('leaderboard_updates', {})
+            for dept, vals in lb_updates.items():
+                att = int(vals.get('attempts', 0))
+                cor = int(vals.get('correct', 0))
+                lb_ref = db.collection('leaderboard').document(uid)
+                try:
+                    # Use update with increments; if missing, set initial structure
+                    if att > 0:
+                        batch.update(lb_ref, {f'departments.{dept}.attempts': firestore.Increment(att), 'updatedAt': datetime.utcnow()})
+                    if cor > 0:
+                        batch.update(lb_ref, {f'departments.{dept}.correct': firestore.Increment(cor)})
+                except Exception:
+                    init = {
+                        'departments': {
+                            dept: {
+                                'attempts': att,
+                                'correct': cor
+                            }
+                        },
+                        'updatedAt': datetime.utcnow()
+                    }
+                    batch.set(lb_ref, init, merge=True)
+
+            try:
+                batch.commit()
+            except Exception as e:
+                logger.error(f"Failed to flush session for user {uid}: {e}")
+
+            # Merge flushed values into cached user doc so cache stays consistent
+            cached = user_cache.get(uid, {})
+            if attempts_inc > 0:
+                cached['totalAttempts'] = cached.get('totalAttempts', 0) + attempts_inc
+            if correct_inc > 0:
+                cached['totalCorrect'] = cached.get('totalCorrect', 0) + correct_inc
+            cached['currentSession'] = session.copy()
+            user_cache[uid] = cached
+
+            # If session finished (not active), remove session cache
+            if not session.get('sessionActive', True):
+                session_cache.pop(uid, None)
+
+    # Run the async flush synchronously in the event loop
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            asyncio.ensure_future(_do_flush())
+        else:
+            loop.run_until_complete(_do_flush())
+    except Exception:
+        # Fallback to direct call
+        asyncio.run(_do_flush())
 
 def create_user(user_id, referrer_id=None, ref_dept=None):
     """Create a user record and optionally record a referral for a specific department.
@@ -94,6 +247,11 @@ def create_user(user_id, referrer_id=None, ref_dept=None):
         'currentSession': None
     }
     user_doc_ref.set(user_data)
+    # Cache the created user doc to avoid immediate re-reads
+    try:
+        user_cache[str(user_id)] = user_data
+    except Exception:
+        pass
 
     # Handle Referral (department-specific)
     if referrer_id and str(referrer_id) != str(user_id) and ref_dept:
@@ -192,8 +350,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif args and args[0].startswith('dept_'):
         dept_to_start = unquote_plus(args[0][5:])
 
-    # 1. Create/Get User
-    user_data = get_user_data(user.id)
+    # 1. Create/Get User (read once and cache)
+    user_data = get_user_data(user.id, force_refresh=True)
     referral_recorded = False
     dept_unlocked = False
 
@@ -311,11 +469,16 @@ async def start_quiz(update: Update, context: ContextTypes.DEFAULT_TYPE, dept_id
         'correct_in_session': 0,
         'attempted_in_session': 0,
         'sessionActive': True,
-        'ad_break_counter': 0
+        'ad_break_counter': 0,
+        # Accumulate leaderboard updates locally: dept_id -> {attempts, correct}
+        'leaderboard_updates': {}
     }
-    
-    db.collection('users').document(str(user_id)).update({'currentSession': session})
-    
+    # Store session in-memory; defer writes until session ends or user exits
+    session_cache[str(user_id)] = session
+    # Also reflect in-memory in user cache for consistent reads
+    if str(user_id) in user_cache:
+        user_cache[str(user_id)]['currentSession'] = session
+
     await send_question(update, context, user_id, session)
 
 async def send_question(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id, session):
@@ -324,11 +487,15 @@ async def send_question(update: Update, context: ContextTypes.DEFAULT_TYPE, user
     
     # --- CHECK REFERRAL LOCK (After Q25) ---
     if q_index == 25:
-        user_doc = get_user_data(user_id)
+        # Referral/unlock checks must be live (not from cache)
+        try:
+            live_doc = db.collection('users').document(str(user_id)).get()
+            user_doc_live = live_doc.to_dict() if live_doc.exists else {}
+        except Exception:
+            user_doc_live = {}
+
         # If this department isn't unlocked for the user, require referrals specific to this dept
-        unlocked = False
-        if user_doc:
-            unlocked = bool(user_doc.get('unlocked_departments', {}).get(dept_id, False))
+        unlocked = bool(user_doc_live.get('unlocked_departments', {}).get(dept_id, False))
         if not unlocked:
             # Send Summary first
             await send_session_summary(update, context, session, "🔒 Progress Locked")
@@ -353,8 +520,11 @@ async def send_question(update: Update, context: ContextTypes.DEFAULT_TYPE, user
 
     # --- CHECK COMPLETION (After Q100) ---
     if q_index >= 100:
+        # Mark session finished and flush accumulated stats to Firestore
+        session['sessionActive'] = False
         await send_session_summary(update, context, session, "🏆 Session Complete")
-        db.collection('users').document(str(user_id)).update({'currentSession.sessionActive': False})
+        session_cache[str(user_id)] = session
+        flush_user_session(user_id, reason='complete')
         await show_main_menu(update, context)
         return
 
@@ -390,18 +560,10 @@ async def send_question(update: Update, context: ContextTypes.DEFAULT_TYPE, user
                 logger.error(f"Ad error: {e}")
 
     # --- FETCH QUESTION ---
-    # Questions are stored in 'departments/{dept_id}/questions/{q_id}'
-    # We assume questions are ordered by 'question_number' or ID.
-    # To avoid high reads, we should query by number.
+    # Use cached department questions to avoid repeated Firestore reads
     q_num = q_index + 1
-    
-    # Query for the specific question number
-    q_ref = db.collection('departments').document(dept_id).collection('questions').where('question_number', '==', q_num).limit(1).stream()
-    
-    question_data = None
-    for q in q_ref:
-        question_data = q.to_dict()
-        break
+    _load_department_questions_into_cache(dept_id)
+    question_data = dept_questions_cache.get(dept_id, {}).get(q_num)
     
     if not question_data:
         # Fallback if question missing
@@ -459,11 +621,13 @@ async def handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     selected_opt = parts[1] # 'a'
     q_num = int(parts[2])
     
-    # Get Session
-    user_doc = db.collection('users').document(str(user_id))
-    user_data = user_doc.get().to_dict()
-    session = user_data.get('currentSession')
-    
+    # Get Session from in-memory cache; fall back to cached user doc
+    uid = str(user_id)
+    session = session_cache.get(uid)
+    if not session:
+        ud = get_user_data(user_id)
+        session = ud.get('currentSession') if ud else None
+
     if not session or not session.get('sessionActive'):
         await query.answer("Session expired.")
         return
@@ -473,65 +637,37 @@ async def handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer("Please wait...", show_alert=True)
         return
 
-    # Fetch Question Data again for verification
+    # Fetch question from cache (to avoid Firestore read)
     dept_id = session['department_id']
-    q_ref = db.collection('departments').document(dept_id).collection('questions').where('question_number', '==', q_num).limit(1).stream()
-    q_data = None
-    for q in q_ref:
-        q_data = q.to_dict()
-        break
-        
-    is_correct = (selected_opt == q_data['answer'])
-    
-    # Update Stats
-    updates = {
-        'totalAttempts': firestore.Increment(1),
-        'currentSession.attempted_in_session': firestore.Increment(1),
-        'currentSession.current_question_index': firestore.Increment(1)
-    }
-    
-    if is_correct:
-        updates['totalCorrect'] = firestore.Increment(1)
-        updates['currentSession.correct_in_session'] = firestore.Increment(1)
-        status_text = "✓ Correct"
-    else:
-        status_text = "✗ Incorrect"
-        
-    user_doc.update(updates)
-    
-    # Update Session Object Locally for Next Step
-    session['current_question_index'] += 1
-    session['attempted_in_session'] += 1
-    if is_correct:
-        session['correct_in_session'] += 1
+    _load_department_questions_into_cache(dept_id)
+    q_data = dept_questions_cache.get(dept_id, {}).get(q_num)
+    if not q_data:
+        await query.answer("Question data not found.")
+        return
 
-    # --- Update leaderboard per-department ---
-    try:
-        lb_ref = db.collection('leaderboard').document(str(user_id))
-        dept = dept_id
-        # Ensure doc exists otherwise prepare initial structure
-        try:
-            # Increment attempts
-            lb_ref.update({
-                f'departments.{dept}.attempts': firestore.Increment(1),
-                'updatedAt': datetime.utcnow()
-            })
-            if is_correct:
-                lb_ref.update({f'departments.{dept}.correct': firestore.Increment(1)})
-        except Exception:
-            # Doc or field missing - create initial doc for this dept
-            init = {
-                'departments': {
-                    dept: {
-                        'attempts': 1,
-                        'correct': 1 if is_correct else 0
-                    }
-                },
-                'updatedAt': datetime.utcnow()
-            }
-            lb_ref.set(init, merge=True)
-    except Exception as e:
-        logger.error(f"Leaderboard update failed: {e}")
+    is_correct = (selected_opt == q_data.get('answer'))
+
+    # Update in-memory session counters (defer Firestore writes until flush)
+    session['current_question_index'] = session.get('current_question_index', 0) + 1
+    session['attempted_in_session'] = session.get('attempted_in_session', 0) + 1
+    if is_correct:
+        session['correct_in_session'] = session.get('correct_in_session', 0) + 1
+
+    # Track leaderboard deltas per dept (accumulate)
+    lb = session.setdefault('leaderboard_updates', {})
+    dept_update = lb.setdefault(dept_id, {'attempts': 0, 'correct': 0})
+    dept_update['attempts'] += 1
+    if is_correct:
+        dept_update['correct'] += 1
+
+    # Update local cached user totals so UI like /show_score reflects current in-memory state
+    cached_user = user_cache.get(uid, {})
+    cached_user['totalAttempts'] = cached_user.get('totalAttempts', 0) + 1
+    if is_correct:
+        cached_user['totalCorrect'] = cached_user.get('totalCorrect', 0) + 1
+    user_cache[uid] = cached_user
+
+    status_text = "✓ Correct" if is_correct else "✗ Incorrect"
 
     # Edit Message
     explanation = q_data.get('explanation', 'No explanation provided.')
@@ -569,8 +705,11 @@ async def handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def next_question_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    user_data = get_user_data(user_id)
-    session = user_data.get('currentSession')
+    uid = str(user_id)
+    session = session_cache.get(uid)
+    if not session:
+        ud = get_user_data(user_id)
+        session = ud.get('currentSession') if ud else None
     await send_question(update, context, user_id, session)
 
 async def send_session_summary(update: Update, context: ContextTypes.DEFAULT_TYPE, session, title):
@@ -631,9 +770,20 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     elif data == "home_exit":
-        user_data = get_user_data(user_id)
-        if user_data and user_data.get('currentSession'):
-            await send_session_summary(update, context, user_data['currentSession'], "Paused Session")
+        # Pause and flush session to Firestore
+        uid = str(user_id)
+        session = session_cache.get(uid)
+        if not session:
+            ud = get_user_data(user_id)
+            session = ud.get('currentSession') if ud else None
+
+        if session:
+            await send_session_summary(update, context, session, "Paused Session")
+            # mark session as paused (still present) and flush
+            session['sessionActive'] = False
+            session_cache[uid] = session
+            flush_user_session(user_id, reason='paused')
+
         await show_main_menu(update, context)
 
     elif data == "home_cancel":
@@ -656,7 +806,12 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data.startswith("check_lock"):
         # Re-check referral count for the specific department
         # callback_data may be 'check_lock' or 'check_lock_<dept_enc>'
-        user_data = get_user_data(user_id)
+        # Use a live read for referral checks (do not rely on cache)
+        try:
+            live_doc = db.collection('users').document(str(user_id)).get()
+            user_data = live_doc.to_dict() if live_doc.exists else {}
+        except Exception:
+            user_data = get_user_data(user_id)
         dept = None
         if data == "check_lock":
             dept = None
